@@ -1,4 +1,4 @@
-
+## external import
 import PyPDF2
 import os
 import shutil
@@ -7,11 +7,25 @@ from email.message import EmailMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
+from email import policy
+from email.parser import BytesParser
+from email.utils import parseaddr
+import imaplib
+
+## internal import
+from config import *
+
+
 
 class PDf_email_generator:
     def __init__(self, File_listener_folder, Output_File_Location):
         self.File_listener_folder = File_listener_folder
         self.Output_File_Location = Output_File_Location
+        ## default self values
+        self.Send_to = None
+        self.File_No = None
+        self.Due_Date = None
+        self.Total_amount = None
 
 
     def pdf_reader(self):
@@ -21,28 +35,29 @@ class PDf_email_generator:
         # Get the total number of pages
         numPages = len(pdfReader.pages) 
         # Loop through each page and extract the text
+        all_text = ""
         for pageNum in range(numPages):
             pageObj = pdfReader.pages[pageNum]
-            text = pageObj.extract_text()
-            print(text)
+            all_text += pageObj.extract_text()
+            print(all_text)
 
-        for line in text.splitlines():
-            if "Bill To" in line:
-                self.Bill_to = line.split("Bill To: ")[1]
-                self.Bill_to = self.Bill_to.split("Invoice No: ")[0]
-                print(self.Bill_to)
-            if "Invoice No" in line:
-                self.invoice_no = line.split("Invoice No: ")[1]
-                print(self.invoice_no)
+        for key in KEY_INFO_DICT_NEW.keys():
+            if key in all_text:
+                self.file_purpose = key
+                print(f"self.file_purpose: {self.file_purpose}")
+                break
+        
+        # Extract the information
 
-            if "Due Date" in line:
-                self.Due_date = line.split("Due Date: ")[1]
-                print(self.Due_date)
+        for key, info in KEY_INFO_DICT_NEW[self.file_purpose][EXTRACT_KEY_DICT].items():
+            if info in all_text:
+                setattr(self, key, all_text.split(info)[1].split('\n')[0].strip())
 
-            if "Total " in line:
-                self.Total_amount = line.split("Total ")[1]
-                print(self.Total_amount)
-        # Close the PDF file object
+                if key == SEND_TO:  ## usually followed by "Invoice No" or "Estimate No"
+                    setattr(self, key, getattr(self, key).split(KEY_INFO_DICT_NEW[self.file_purpose][EXTRACT_KEY_DICT][FILE_NO])[0])
+                print(f"self.{key}:  {getattr(self, key)}")
+                print("------------------")
+                continue
         pdfFileObj.close()
         return self
 
@@ -51,8 +66,10 @@ class PDf_email_generator:
     def rename_pdf(self):
     # get the source file name
         source_filename = self.file_path
-        new_pdf_name = f"{self.invoice_no}.pdf"
-        
+        new_pdf_name = f"{self.File_No}-{service_party}.pdf"
+        print(f"self.File_No: {self.File_No}")
+        print("source_filename:", source_filename)
+        print("new_pdf_name:", new_pdf_name)
         # get the destination folder
         destination_folder = self.Output_File_Location
         
@@ -73,33 +90,37 @@ class PDf_email_generator:
 
     def email_sender(self):
         msg = MIMEMultipart()
-        port = 465  # For SSL
         smtp_server = "smtp.gmail.com"
-        sender_email = "@gmail.com" # Enter your address
-        receiver_email = ""  # Enter receiver address
-        password = ""
-        
-        body = f"""
-        Hi,
 
-        I am writing to inform you that the invoice {self.invoice_no} for the services we rendered to {self.Bill_to} Store is now ready and attached in this email. The invoice amount is {self.Total_amount} in total.
-        We would appreciate prompt payment of this invoice within {self.Due_date}. If you have any questions or concerns regarding the invoice, Please feel free to reach out to us.
+        email_obj = email_body(self.File_No, self.Send_to, self.Total_amount, self.Due_Date)
 
-        Thank you for your business.
+        if self.file_purpose == INVOICE:
+            body = email_body(self.File_No, self.Send_to, self.Total_amount, self.Due_Date).invoice_email_body()
+        elif self.file_purpose == ESTIMATE:
+            body = email_body(self.File_No, self.Send_to, self.Total_amount, self.Due_Date).estimate_email_body()
+        else:
+            body = "Error: File purpose is not identified."
 
-        Best regards, 
-        Josh R"""
-        
+        purpose_method_mapping = {
+            INVOICE: email_obj.invoice_email_body(),
+            ESTIMATE: email_obj.estimate_email_body()
+        }
+
+        try:
+            body = purpose_method_mapping.get(self.file_purpose)
+        except:
+            body = "Error: File purpose is not identified."
+
         msg.attach(MIMEText(body, 'plain'))
-        msg['Subject'] = f"Invoice {self.invoice_no} for - from SMTP server"
+        msg['Subject'] = f"{self.file_purpose} {self.File_No} for {service_party} - from SMTP server"
         msg['From'] = sender_email
         msg['To'] = receiver_email
         
         ### attach the pdf file
 
-        with open(f"{self.Output_File_Location}/{self.invoice_no}.pdf", "rb") as f:
-            part = MIMEApplication(f.read(),Name = f"{self.invoice_no}.pdf")
-        part['Content-Disposition'] = f'attachment; filename = {self.invoice_no}.pdf'
+        with open(f"{self.Output_File_Location}/{self.File_No}-{service_party}.pdf", "rb") as f:
+            part = MIMEApplication(f.read(),Name = f"{self.File_No}-{service_party}.pdf")
+        part['Content-Disposition'] = f'attachment; filename = {self.File_No}-{service_party}.pdf'
         msg.attach(part)
 
         context = ssl.create_default_context()
@@ -107,9 +128,55 @@ class PDf_email_generator:
             server.login(sender_email, password)
             server.send_message(msg, from_addr=sender_email, to_addrs=receiver_email)
 
+    def email_listener(self, user_email, user_password, download_folder='.'):
+        
+        # Connect to the Gmail IMAP server
+        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail.login(user_email, user_password)
+        mail.select('inbox')
 
+        # Search for all unread emails
+        result, data = mail.search(None, '(UNSEEN SUBJECT "execute")')
+        if result == 'OK':
+            for num in data[0].split():
+                # Fetch the email by ID
+                result, email_data = mail.fetch(num, '(RFC822)')
+                if result == 'OK':
+                    raw_email = email_data[0][1]
+                    # Parse the email content
+                    msg = BytesParser(policy=policy.default).parsebytes(raw_email)
+                    
+                    # Extract sender's email address
+                    from_email = parseaddr(msg["from"])[1]
+
+                    # Check if the sender is in the whitelist
+                    if from_email not in WHITELIST:
+                        print(f"Ignored email from non-whitelisted sender: {from_email}")
+                        continue
+
+                    print("Subject:", msg["subject"])
+                    print("From:", msg["from"])
+                    
+                    # Checking for attachments
+                    for part in msg.walk():
+                        content_disposition = str(part.get("Content-Disposition"))
+                        if "attachment" in content_disposition:
+                            filename = part.get_filename()
+                            if filename:
+                                filepath = os.path.join(download_folder, filename)
+                                with open(filepath, 'wb') as f:
+                                    f.write(part.get_payload(decode=True))
+                                print(f"Downloaded attachment to {filepath}")
+                    
+                    # Mark the email as read
+                    mail.store(num, '+FLAGS', '\\Seen')
+        mail.logout()
+        return self
 
     def file_runner(self):
+        self.email_listener(user_email= sender_email,
+                                    user_password = password, 
+                                    download_folder= self.File_listener_folder)
         if len(os.listdir(self.File_listener_folder)) == 0:
             print("Folder is empty.")
         else:
